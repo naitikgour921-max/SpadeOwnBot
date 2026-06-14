@@ -1,528 +1,454 @@
 const TelegramBot = require('node-telegram-bot-api');
 const { MongoClient } = require('mongodb');
+const fs = require('fs');
 
-// ==========================================
-// CONFIGURATION & SETUP
-// ==========================================
-// Railway Environment Variables fetch karega, warna default use karega
-const API_TOKEN = process.env.BOT_TOKEN || '8962692068:AAGlyid0J5PwKsuVeLDr9dMWmNM7Mm94-Ig';
-const ADMIN_ID = process.env.ADMIN_ID || '7901189048';
-const MONGO_URL = process.env.MONGO_URL; // Railway ka MongoDB URL
+// --- Configuration ---
+const botToken = process.env.BOT_TOKEN || "8962692068:AAGlyid0J5PwKsuVeLDr9dMWmNM7Mm94-Ig";
+const adminId = process.env.ADMIN_ID || "5585391580";
+const mongoUrl = process.env.MONGO_URL;
 
-if (!MONGO_URL) {
-    console.error("❌ ERROR: MONGO_URL nahi mili! Railway variables check karo.");
+if (!mongoUrl) {
+    console.error("❌ MONGO_URL missing! Railway me variable check karo.");
     process.exit(1);
 }
 
-// Bot Initialization (With forced stop for old instances)
-const bot = new TelegramBot(API_TOKEN, { 
-    polling: {
-        params: { drop_pending_updates: true } // Purane atke hue messages ignore karega
-    } 
+// Bot init with drop_pending_updates
+const bot = new TelegramBot(botToken, { 
+    polling: { params: { drop_pending_updates: true } } 
 });
 
-console.log("✅ Bot is running...");
+console.log("🤖 Bot is starting...");
 
-// ==========================================
-// MONGODB DATABASE SETUP
-// ==========================================
-const client = new MongoClient(MONGO_URL);
-let db, usersCol, configCol;
+// --- MongoDB Setup ---
+const client = new MongoClient(mongoUrl);
+let db, dataCol, waitingCol;
 
 async function initDB() {
     await client.connect();
-    db = client.db('telegramBotDB');
-    usersCol = db.collection('users');
-    configCol = db.collection('config');
+    db = client.db('PremiumBotDB');
+    dataCol = db.collection('bot_data');
+    waitingCol = db.collection('waiting_list');
 
-    // Default Config Set Karna agar pehli baar chal raha ho
-    let config = await configCol.findOne({ _id: 'main' });
-    if (!config) {
-        config = {
-            _id: 'main',
-            prices: { desi: 49, mother: 59, brother: 59, forced: 69, child: 79, all: 149 },
-            links: { desi: '', mother: '', brother: '', forced: '', child: '', all: '' },
-            upi: { id: 'paytm.admin@pty', name: 'ᴀᴅᴍɪɴ' },
-            support: '@AdminSupport',
-            stats: { starts: 0, approvals: 0, rejections: 0 },
-            videos: { welcome: [], after_welcome: [], demo: [] }
-        };
-        await configCol.insertOne(config);
+    // Data Migration from Local JSON to MongoDB
+    let existingData = await dataCol.findOne({ _id: "mainData" });
+    if (!existingData) {
+        console.log("🔄 MongoDB me data nahi mila. Local data.json se import kar raha hu...");
+        let initialData;
+        if (fs.existsSync('data.json')) {
+            initialData = JSON.parse(fs.readFileSync('data.json', 'utf8'));
+        } else {
+            initialData = {
+                users: [], user_details: {}, demos: [], states: {}, pending: [],
+                history: { approved: 0, rejected: 0 },
+                settings: {
+                    upi: 'example@ybl', support: '@nglynx', premium_image: 'https://i.ibb.co/9x38myC/x.jpg',
+                    price_indian: '199', price_premium: '299', price_movies: '399', price_all: '499',
+                    link_indian: 'https://t.me/link1', link_premium: 'https://t.me/link2', link_movies: 'https://t.me/link3', link_all: 'https://t.me/link4'
+                }
+            };
+        }
+        initialData._id = "mainData";
+        await dataCol.insertOne(initialData);
+        
+        if (fs.existsSync('waiting.json')) {
+            let waitData = JSON.parse(fs.readFileSync('waiting.json', 'utf8'));
+            if (Object.keys(waitData).length > 0) {
+                await waitingCol.insertOne({ _id: "waitList", data: waitData });
+            }
+        }
+        console.log("✅ Data Migration Complete!");
+    } else {
+        console.log("✅ MongoDB already has data. Ready to go!");
     }
-    console.log("✅ MongoDB Connected!");
+
+    let waitListCheck = await waitingCol.findOne({ _id: "waitList" });
+    if (!waitListCheck) await waitingCol.insertOne({ _id: "waitList", data: {} });
 }
+
 initDB();
 
-// ==========================================
-// UTILITIES & CONSTANTS
-// ==========================================
-const delay = ms => new Promise(res => setTimeout(res, ms));
+// --- Helper Functions ---
+async function getData() { return await dataCol.findOne({ _id: "mainData" }); }
+async function saveData(data) { await dataCol.replaceOne({ _id: "mainData" }, data); }
+async function getWaiting() { let res = await waitingCol.findOne({ _id: "waitList" }); return res ? res.data : {}; }
+async function saveWaiting(waitData) { await waitingCol.replaceOne({ _id: "waitList" }, { _id: "waitList", data: waitData }); }
 
-const categories = {
-    desi: 'ᴅᴇsɪ ᴘᴏʀɴ 720ᴘ',
-    mother: 'ᴍᴏᴛʜᴇʀ sᴏɴ 720ᴘ',
-    brother: 'ʙʀᴏᴛʜᴇʀ sɪsᴛᴇʀ 720ᴘ',
-    forced: 'ꜰᴏʀᴄᴇᴅ ʀᴀᴘᴇ 720ᴘ',
-    child: 'ᴄʜɪʟᴅ ᴘᴏʀɴ 720ᴘ',
-    all: 'ᴀʟʟ ɪɴ ᴏɴᴇ 1444ᴘ'
-};
-
-async function sendCleanMsg(cid, txt, kb = null, mediaUrl = null, is_video = false) {
-    let user = await usersCol.findOne({ id: cid });
-    
-    // Purana Message Delete
-    if (user && user.last_msg_id) {
-        try { await bot.deleteMessage(cid, user.last_msg_id); } catch(e) {}
-    }
-    
-    let opts = { parse_mode: 'HTML' };
-    if (kb) opts.reply_markup = kb; // Object hi pass karna hai node-telegram-bot-api mein
-    
-    let sentMsg;
-    try {
-        if (mediaUrl) {
-            opts.caption = txt;
-            if (is_video) sentMsg = await bot.sendVideo(cid, mediaUrl, opts);
-            else sentMsg = await bot.sendPhoto(cid, mediaUrl, opts);
-        } else {
-            sentMsg = await bot.sendMessage(cid, txt, opts);
-        }
-        
-        // Naya message ID save karo
-        if (user && sentMsg) {
-            user.last_msg_id = sentMsg.message_id;
-            await usersCol.replaceOne({ id: cid }, user);
-        }
-        return sentMsg ? sentMsg.message_id : null;
-    } catch (e) {
-        console.error("Message Error:", e.message);
-        return null;
-    }
+function getAdminMenu() {
+    return {
+        keyboard: [
+            [{ text: 'Change UPI' }, { text: 'Change Username' }],
+            [{ text: 'Change Price' }, { text: 'Add Links' }],
+            [{ text: 'Change Premium Image' }, { text: 'Process Link Video' }], 
+            [{ text: 'Add Demo Video' }, { text: 'Remove Demo' }],
+            [{ text: 'Check Users List' }, { text: 'Check History' }]
+        ],
+        resize_keyboard: true
+    };
 }
 
-// ==========================================
-// EVENT LISTENER: INCOMING MESSAGES
-// ==========================================
+const packEmojiMap = {
+    'indian': '👉 INDIAN VIDEOS 👈',
+    'premium': '🤤 R@P VIDEOS 🤤',
+    'movies': '👄 CHILD VIDEOS (50k+)😵',
+    'all': '🥵 ALL IN ONE 50+ GROUPS ✅'
+};
+
+const categoryMap = { 'Indian': 'indian', 'R@p': 'premium', 'Child': 'movies', 'All': 'all' };
+
+// --- 5-Minute Cron Job (Interval) ---
+setInterval(async () => {
+    if (!db) return;
+    let waiting = await getWaiting();
+    let changed = false;
+    const now = Math.floor(Date.now() / 1000);
+
+    for (let cid in waiting) {
+        if (now - waiting[cid].time >= 300) {
+            let info = waiting[cid];
+            let oldPrice = parseInt(info.price);
+            let newPrice = Math.round(oldPrice * 0.80);
+            let packKey = info.pack;
+            let exactPackName = packEmojiMap[packKey] || (packKey.charAt(0).toUpperCase() + packKey.slice(1) + " Videos");
+            
+            let offerMsg = `🎉 <b>𝐒𝐏𝐄𝐂𝐈𝐀𝐋 𝐎𝐅𝐅𝐄𝐑 𝐎𝐍𝐋𝐘 𝐅𝐎𝐑 𝐘𝐎𝐔</b> 🎉\n\n𝐃𝐞𝐬𝐢 𝐋𝐞𝐚𝐤𝐬 🥵\n€𝐏 𝐕𝐢𝐝𝐞𝐨𝐬 💦\n𝐈𝐧𝐝𝐢𝐚𝐧 𝐅𝐨𝐫𝐜𝐞𝐝 𝐏*𝐫𝐧 🤤\n\n📦 <b>𝗬𝗼𝘂𝗿 𝗣𝗮𝗰𝗸:</b> ${exactPackName}\n❌ <b>𝖮𝗋𝗂𝗀𝗂𝗇𝖺𝗅 𝖯𝗋𝗂𝖼𝖾:</b> ₹${oldPrice}\n✅ <b>𝖮𝖿𝖿𝖾𝗋 𝖯𝗋𝗂𝖼𝖾:</b> ₹${newPrice}\n\n👇 <i> 𝖭𝗂𝖼𝗁𝖾 𝖡𝗎𝗍𝗍𝗈𝗇 𝖢𝗅𝗂𝖼𝗄 𝖪𝖺𝗋𝗄𝖾 𝖠𝗉𝗇𝖺 𝟐𝟎% 𝖣𝗂𝗌𝖼𝗈𝗎𝗇𝗍 𝖢𝗅𝖺𝗂𝗆 𝖪𝖺𝗋𝗅𝖾𝗂𝗇</i>`;
+            
+            let offerBtn = { inline_keyboard: [[{ text: `🤩 𝐂𝐋𝐀𝐈𝐌 𝐎𝐅𝐅𝐄𝐑 (₹${newPrice})`, callback_data: `specialoffer_${info.pack}_${newPrice}` }]] };
+            
+            try { await bot.sendMessage(cid, offerMsg, { parse_mode: 'HTML', reply_markup: offerBtn }); } catch (e) {}
+            
+            delete waiting[cid];
+            changed = true;
+        }
+    }
+    if (changed) await saveWaiting(waiting);
+}, 30000); // Check every 30 seconds
+
+// --- Message Handler ---
 bot.on('message', async (msg) => {
-    if (!usersCol || !configCol) return; // Wait for DB to connect
-
+    if (!db) return;
     const chatId = msg.chat.id.toString();
-    const fromId = msg.from.id.toString();
     const text = msg.text || '';
-    const firstName = msg.from.first_name || 'ᴜsᴇʀ';
-    const username = msg.from.username || 'ɴᴏᴜsᴇʀɴᴀᴍᴇ';
-    const isAdmin = (fromId === ADMIN_ID);
+    const captionText = msg.caption || '';
+    const photo = msg.photo;
+    const video = msg.video;
+    const firstName = msg.from.first_name || 'User';
+    const username = msg.from.username || 'NoUsername';
+    const isAdmin = (chatId === adminId);
 
-    let config = await configCol.findOne({ _id: 'main' });
-    let user = await usersCol.findOne({ id: fromId });
+    let data = await getData();
 
-    // NEW USER REGISTRATION
-    if (!user) {
-        user = {
-            id: fromId, name: firstName, username: username,
-            joined: new Date().toISOString().replace(/T/, ' ').replace(/\..+/, ''),
-            state: 'none', last_msg_id: null,
-            history: { approved: 0, pending: 0, total: 0 },
-            active_packs: []
-        };
-        await usersCol.insertOne(user);
-        
-        config.stats.starts++;
-        await configCol.replaceOne({ _id: 'main' }, config);
-        
-        bot.sendMessage(ADMIN_ID, `📣 <b>ɴᴇᴡ ᴜsᴇʀ sᴛᴀʀᴛᴇᴅ ʙᴏᴛ</b>\nɴᴀᴍᴇ: <a href='tg://user?id=${fromId}'>${firstName}</a>\nɪᴅ: <code>${fromId}</code>`, { parse_mode: 'HTML' });
-    }
-
-    const u_state = user.state;
-
-    // 1. PHOTO UPLOAD (SCREENSHOT) HANDLER
-    if (msg.photo && u_state.startsWith('wait_screenshot_')) {
-        const pack = u_state.replace('wait_screenshot_', '');
-        const photoId = msg.photo[msg.photo.length - 1].file_id; // Highest resolution
-        
-        user.state = 'none';
-        user.history.pending++;
-        await usersCol.replaceOne({ id: fromId }, user);
-
-        const admin_txt = `💳 <b>ɴᴇᴡ ᴘᴀʏᴍᴇɴᴛ ʀᴇǫᴜᴇsᴛ</b>\n\n👤 ɴᴀᴍᴇ: ${firstName}\n📛 ᴜsᴇʀɴᴀᴍᴇ: @${username}\n🆔 ɪᴅ: <code>${fromId}</code>\n📦 ᴘᴀᴄᴋ: <b>${categories[pack]}</b>`;
-        const admin_kb = { inline_keyboard: [
-            [{ text: '✅ ᴀᴘᴘʀᴏᴠᴇ', callback_data: `approve_${fromId}_${pack}` }, { text: '❌ ʀᴇᴊᴇᴄᴛ', callback_data: `reject_${fromId}_${pack}` }]
-        ]};
-        
-        await bot.sendPhoto(ADMIN_ID, photoId, { caption: admin_txt, parse_mode: 'HTML', reply_markup: admin_kb });
-        
-        const confirm_txt = `⏳ ᴘᴀʏᴍᴇɴᴛ sᴇɴᴛ ꜰᴏʀ ᴀᴘᴘʀᴏᴠᴀʟ ᴛᴏ ᴀᴅᴍɪɴ\n\n📞 ᴄᴏɴᴛᴀᴄᴛ sᴜᴘᴘᴏʀᴛ: ${config.support}`;
-        await sendCleanMsg(chatId, confirm_txt, { inline_keyboard: [[{ text: '⬅️ ʙᴀᴄᴋ ᴛᴏ ʜᴏᴍᴇ', callback_data: 'home' }]] }, "https://i.ibb.co/1YCk5tj8/x.jpg", false);
+    // /checkms (Admin Speed Check)
+    if (isAdmin && text === '/checkms') {
+        const start = Date.now();
+        const sentMsg = await bot.sendMessage(chatId, "⏱ Checking response speed...");
+        const diff = Date.now() - start;
+        const seconds = (diff / 1000).toFixed(2);
+        bot.editMessageText(`✅ Bot Speed is working perfectly!\n\n⚡ Response Time: **${seconds} seconds**`, { chat_id: chatId, message_id: sentMsg.message_id, parse_mode: 'Markdown' });
         return;
     }
 
-    // 2. ADMIN TEXT INPUT HANDLERS
-    if (isAdmin && text !== '' && !text.startsWith('/')) {
-        if (text === '📊 sᴛᴀᴛs') {
-            const userCount = await usersCol.countDocuments();
-            const txt = `📊 <b>ʙᴏᴛ sᴛᴀᴛɪsᴛɪᴄs</b>\n\n👥 ᴛᴏᴛᴀʟ ᴜsᴇʀs: ${userCount}\n▶️ ᴛᴏᴛᴀʟ sᴛᴀʀᴛs: ${config.stats.starts}\n✅ ᴀᴘᴘʀᴏᴠᴇᴅ: ${config.stats.approvals}\n❌ ʀᴇᴊᴇᴄᴛᴇᴅ: ${config.stats.rejections}`;
-            bot.sendMessage(chatId, txt, { parse_mode: 'HTML' });
-            return;
-        }
-        else if (text === '👥 ᴜsᴇʀs') {
-            const allUsers = await usersCol.find({}).toArray();
-            let list = allUsers.map(u => ({ id: u.id, name: u.name, user: "@"+u.username }));
-            for (let i = 0; i < list.length; i += 50) {
-                const chunk = list.slice(i, i + 50);
-                bot.sendMessage(chatId, `<pre>${JSON.stringify(chunk, null, 2)}</pre>`, { parse_mode: 'HTML' });
-            }
-            return;
-        }
-        else if (text === '💰 ᴘʀɪᴄᴇs') {
-            let kb = { inline_keyboard: [] };
-            for (const [k, n] of Object.entries(categories)) {
-                kb.inline_keyboard.push([{ text: `${n} (₹${config.prices[k]})`, callback_data: `edit_price_${k}` }]);
-            }
-            bot.sendMessage(chatId, "💰 <b>ᴇᴅɪᴛ ᴘʀɪᴄᴇs</b>\nsᴇʟᴇᴄᴛ ᴄᴀᴛᴇɢᴏʀʏ:", { parse_mode: 'HTML', reply_markup: kb });
-            return;
-        }
-        else if (text === '🔗 ʟɪɴᴋs') {
-            let kb = { inline_keyboard: [] };
-            for (const [k, n] of Object.entries(categories)) {
-                kb.inline_keyboard.push([{ text: n, callback_data: `edit_link_${k}` }]);
-            }
-            bot.sendMessage(chatId, "🔗 <b>ᴇᴅɪᴛ ʟɪɴᴋs</b>\nsᴇʟᴇᴄᴛ ᴄᴀᴛᴇɢᴏʀʏ:", { parse_mode: 'HTML', reply_markup: kb });
-            return;
-        }
-        else if (text === '💳 ᴜᴘɪ') {
-            user.state = 'wait_upi_id'; await usersCol.replaceOne({ id: chatId }, user);
-            bot.sendMessage(chatId, `💳 ᴄᴜʀʀᴇɴᴛ ᴜᴘɪ: <code>${config.upi.id}</code>\n\nsᴇɴᴅ ɴᴇᴡ <b>ᴜᴘɪ ɪᴅ</b>:`, { parse_mode: 'HTML' });
-            return;
-        }
-        else if (text === '📞 sᴜᴘᴘᴏʀᴛ ɪᴅ') {
-            user.state = 'wait_support'; await usersCol.replaceOne({ id: chatId }, user);
-            bot.sendMessage(chatId, `📞 ᴄᴜʀʀᴇɴᴛ sᴜᴘᴘᴏʀᴛ: <code>${config.support}</code>\n\nsᴇɴᴅ ɴᴇᴡ <b>sᴜᴘᴘᴏʀᴛ ᴜsᴇʀɴᴀᴍᴇ</b> (@username):`, { parse_mode: 'HTML' });
-            return;
-        }
-        else if (text === '📢 ʙʀᴏᴀᴅᴄᴀsᴛ') {
-            user.state = 'wait_broadcast'; await usersCol.replaceOne({ id: chatId }, user);
-            bot.sendMessage(chatId, "📢 sᴇɴᴅ ᴍᴇssᴀɢᴇ/ᴘʜᴏᴛᴏ/ᴠɪᴅᴇᴏ ᴛᴏ ʙʀᴏᴀᴅᴄᴀsᴛ:");
-            return;
-        }
-        else if (text === '🎬 ᴠɪᴅᴇᴏs') {
-            const kb = { inline_keyboard: [
-                [{ text: '➕ ᴀᴅᴅ ᴡᴇʟᴄᴏᴍᴇ (1)', callback_data: 'add_vid_welcome' }, { text: '🗑 ʀᴇᴍ ᴡᴇʟᴄᴏᴍᴇ', callback_data: 'rem_vid_welcome' }],
-                [{ text: '➕ ᴀᴅᴅ ᴀꜰᴛᴇʀ (3)', callback_data: 'add_vid_after' }, { text: '🗑 ʀᴇᴍ ᴀꜰᴛᴇʀ', callback_data: 'rem_vid_after' }],
-                [{ text: '➕ ᴀᴅᴅ ᴅᴇᴍᴏs (8)', callback_data: 'add_vid_demo' }, { text: '🗑 ʀᴇᴍ ᴅᴇᴍᴏs', callback_data: 'rem_vid_demo' }]
-            ]};
-            bot.sendMessage(chatId, "🎬 <b>ᴠɪᴅᴇᴏ ᴍᴀɴᴀɢᴇʀ</b>", { parse_mode: 'HTML', reply_markup: kb });
-            return;
-        }
-
-        // STATE PROCESSING
-        if (u_state === 'wait_broadcast') {
-            bot.sendMessage(ADMIN_ID, "⏳ ʙʀᴏᴀᴅᴄᴀsᴛ sᴛᴀʀᴛᴇᴅ...");
-            const allUsers = await usersCol.find({}).toArray();
-            let count = 0;
-            for (const u of allUsers) {
-                try {
-                    await bot.sendMessage(u.id, text, { parse_mode: 'HTML' });
-                    count++;
-                } catch(e) {}
-                await delay(35); // 35ms sleep limits flood
-            }
-            user.state = 'none'; await usersCol.replaceOne({ id: fromId }, user);
-            bot.sendMessage(ADMIN_ID, `✅ ʙʀᴏᴀᴅᴄᴀsᴛ ᴄᴏᴍᴘʟᴇᴛᴇᴅ ᴛᴏ ${count} ᴜsᴇʀs!`);
-            return;
-        }
-        else if (u_state === 'wait_support') {
-            config.support = text; await configCol.replaceOne({ _id: 'main' }, config);
-            user.state = 'none'; await usersCol.replaceOne({ id: fromId }, user);
-            bot.sendMessage(ADMIN_ID, "✅ sᴜᴘᴘᴏʀᴛ ᴜsᴇʀɴᴀᴍᴇ ᴜᴘᴅᴀᴛᴇᴅ!");
-            return;
-        }
-        else if (u_state.startsWith('wait_price_') && !isNaN(text)) {
-            const pack = u_state.replace('wait_price_', '');
-            config.prices[pack] = parseInt(text); await configCol.replaceOne({ _id: 'main' }, config);
-            user.state = 'none'; await usersCol.replaceOne({ id: fromId }, user);
-            bot.sendMessage(ADMIN_ID, `✅ ᴘʀɪᴄᴇ ᴜᴘᴅᴀᴛᴇᴅ ᴛᴏ ₹${text}!`);
-            return;
-        }
-        else if (u_state.startsWith('wait_link_')) {
-            const pack = u_state.replace('wait_link_', '');
-            config.links[pack] = text; await configCol.replaceOne({ _id: 'main' }, config);
-            user.state = 'none'; await usersCol.replaceOne({ id: fromId }, user);
-            bot.sendMessage(ADMIN_ID, "✅ ʟɪɴᴋ ᴜᴘᴅᴀᴛᴇᴅ sᴜᴄᴄᴇssꜰᴜʟʟʏ!");
-            return;
-        }
-        else if (u_state === 'wait_upi_id') {
-            config.upi.id = text; await configCol.replaceOne({ _id: 'main' }, config);
-            user.state = 'wait_upi_name'; await usersCol.replaceOne({ id: fromId }, user);
-            bot.sendMessage(ADMIN_ID, "✅ ᴜᴘɪ ɪᴅ sᴀᴠᴇᴅ.\n\nsᴇɴᴅ ɴᴇᴡ <b>ᴜᴘɪ ɴᴀᴍᴇ</b>:", { parse_mode: 'HTML' });
-            return;
-        }
-        else if (u_state === 'wait_upi_name') {
-            config.upi.name = text; await configCol.replaceOne({ _id: 'main' }, config);
-            user.state = 'none'; await usersCol.replaceOne({ id: fromId }, user);
-            bot.sendMessage(ADMIN_ID, "✅ ᴜᴘɪ ᴘʀᴏꜰɪʟᴇ ᴄᴏᴍᴘʟᴇᴛᴇʟʏ ᴜᴘᴅᴀᴛᴇᴅ!");
-            return;
-        }
+    if (!data.users.includes(Number(chatId)) && !data.users.includes(chatId)) {
+        data.users.push(chatId);
+        let newUserMention = `<a href='tg://user?id=${chatId}'>${firstName.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</a>`;
+        let adminMsg = `🚨 <b>New User Started Bot!</b>\n\n👤 <b>Name:</b> ${newUserMention}\n🆔 <b>Chat ID:</b> <code>${chatId}</code>\n🔗 <b>Username:</b> @${username}`;
+        bot.sendMessage(adminId, adminMsg, { parse_mode: 'HTML' });
     }
+    data.user_details[chatId] = `${firstName} (@${username})`;
+    await saveData(data);
 
-    // 3. ADMIN VIDEO UPLOAD HANDLER
-    if (isAdmin && msg.video && u_state.startsWith('wait_vid_')) {
-        const type = u_state.replace('wait_vid_', '');
-        const vid_id = msg.video.file_id;
-        const limitMap = { welcome: 1, after: 3, demo: 8 };
-        const limit = limitMap[type];
-        const type_key = (type === 'after') ? 'after_welcome' : type;
-        
-        if (config.videos[type_key].length >= limit) {
-            bot.sendMessage(ADMIN_ID, `⚠️ ʟɪᴍɪᴛ ʀᴇᴀᴄʜᴇᴅ ꜰᴏʀ ${type} (${limit}). ᴘʟᴇᴀsᴇ ʀᴇᴍᴏᴠᴇ ᴏʟᴅ ᴠɪᴅᴇᴏs ꜰɪʀsᴛ.`);
-        } else {
-            config.videos[type_key].push(vid_id); await configCol.replaceOne({ _id: 'main' }, config);
-            user.state = 'none'; await usersCol.replaceOne({ id: fromId }, user);
-            bot.sendMessage(ADMIN_ID, `✅ ᴠɪᴅᴇᴏ ᴀᴅᴅᴇᴅ ᴛᴏ ${type}! (${config.videos[type_key].length}/${limit})`);
-        }
-        return;
-    }
+    let state = data.states[chatId] || 'none';
 
-    // 4. START COMMAND
-    if (text === '/start' || text === '/admin') {
-        user.state = 'none'; await usersCol.replaceOne({ id: fromId }, user);
-
-        if (isAdmin) {
-            const txt = "⚜️ <b>ᴡᴇʟᴄᴏᴍᴇ ᴀᴅᴍɪɴ ᴍᴀsᴛᴇʀ!</b>\n\nᴀᴀᴘᴋᴀ ᴍᴀsᴛᴇʀ ᴘᴀɴᴇʟ ʀᴇᴀᴅʏ ʜᴀɪ. ɴᴇᴇᴄʜᴇ ᴅɪʏᴇ ɢᴀʏᴇ ʙᴜᴛᴛᴏɴs sᴇ ʙᴏᴛ ᴄᴏɴᴛʀᴏʟ ᴋᴀʀᴇɪɴ:";
-            const admin_keyboard = {
-                keyboard: [
-                    [{ text: '📊 sᴛᴀᴛs' }, { text: '👥 ᴜsᴇʀs' }],
-                    [{ text: '💰 ᴘʀɪᴄᴇs' }, { text: '🔗 ʟɪɴᴋs' }],
-                    [{ text: '💳 ᴜᴘɪ' }, { text: '📞 sᴜᴘᴘᴏʀᴛ ɪᴅ' }],
-                    [{ text: '📢 ʙʀᴏᴀᴅᴄᴀsᴛ' }, { text: '🎬 ᴠɪᴅᴇᴏs' }]
-                ],
-                resize_keyboard: true,
-                is_persistent: true
-            };
-            bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: admin_keyboard });
-            return;
-        } else {
-            // Normal User
-            const welcomeText = `👋 ʜᴇʟʟᴏ, <b>${firstName}</b>!\n\n⭐️ ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ᴘʀᴇᴍɪᴜᴍ ʙᴏᴛ\n\n━━━━━━━━━━━━━━━━━\n⚜️ ᴘʀᴇᴍɪᴜᴍ ᴘʀɪᴄᴇ: ₹49 - ₹149\n💳 ᴘʟᴀɴs: 6 ᴘʟᴀɴs ᴀᴠᴀɪʟᴀʙʟᴇ\n━━━━━━━━━━━━━━━━━\n\n🔒 ᴘʀᴇᴍɪᴜᴍ ᴄᴏɴᴛᴇɴᴛ ᴀᴄᴄᴇss ᴋᴀʀɴᴇ ᴋᴇ ʟɪʏᴇ ᴘʀᴇᴍɪᴜᴍ ʟᴏ!`;
-            
-            const kb = { inline_keyboard: [
-                [{ text: '🛒 ʙᴜʏ ᴘʀᴇᴍɪᴜᴍ', callback_data: 'buy_premium' }],
-                [{ text: '💎 ᴍʏ ᴘʀᴇᴍɪᴜᴍs 🥵', callback_data: 'my_premiums' }],
-                [{ text: '👤 ᴍʏ ᴘʀᴏꜰɪʟᴇ', callback_data: 'my_profile' }],
-                [{ text: '👀 ᴠɪᴇᴡ ᴅᴇᴍᴏ', callback_data: 'view_demo_0' }]
-            ]};
-            
-            const vid = config.videos.welcome.length > 0 ? config.videos.welcome[0] : null;
-            const sent_id = await sendCleanMsg(chatId, welcomeText, kb, vid, !!vid);
-            
-            if (config.videos.after_welcome.length > 0 && sent_id) {
-                for (const v of config.videos.after_welcome) {
-                    await bot.sendVideo(chatId, v, { reply_to_message_id: sent_id });
-                }
-            }
-            return;
-        }
-    }
-});
-
-// ==========================================
-// EVENT LISTENER: CALLBACK QUERIES
-// ==========================================
-bot.on('callback_query', async (query) => {
-    bot.answerCallbackQuery(query.id); // Stops loading circle immediately
-
-    const chatId = query.message.chat.id.toString();
-    const fromId = query.from.id.toString();
-    const data = query.data;
-    const msgId = query.message.message_id;
-    const firstName = query.from.first_name || 'ᴜsᴇʀ';
-    const username = query.from.username || 'ɴᴏᴜsᴇʀɴᴀᴍᴇ';
-    const isAdmin = (fromId === ADMIN_ID);
-
-    let config = await configCol.findOne({ _id: 'main' });
-    let user = await usersCol.findOne({ id: fromId });
-    if (!user) return; // Failsafe
-
-    // --- ADMIN CALLBACKS ---
     if (isAdmin) {
-        if (data.startsWith('edit_price_')) {
-            const pack = data.replace('edit_price_', '');
-            user.state = `wait_price_${pack}`; await usersCol.replaceOne({ id: chatId }, user);
-            bot.sendMessage(ADMIN_ID, `ᴇɴᴛᴇʀ ɴᴇᴡ ᴘʀɪᴄᴇ ꜰᴏʀ <b>${categories[pack]}</b> (ɴᴜᴍʙᴇʀs ᴏɴʟʏ):`, { parse_mode: 'HTML' });
-            return;
-        }
-        else if (data.startsWith('edit_link_')) {
-            const pack = data.replace('edit_link_', '');
-            user.state = `wait_link_${pack}`; await usersCol.replaceOne({ id: chatId }, user);
-            bot.sendMessage(ADMIN_ID, `sᴇɴᴅ ᴘʀɪᴠᴀᴛᴇ ʟɪɴᴋ ꜰᴏʀ <b>${categories[pack]}</b>:`, { parse_mode: 'HTML' });
-            return;
-        }
-        else if (data.startsWith('add_vid_')) {
-            const type = data.replace('add_vid_', '');
-            user.state = `wait_vid_${type}`; await usersCol.replaceOne({ id: chatId }, user);
-            bot.sendMessage(ADMIN_ID, `sᴇɴᴅ ᴠɪᴅᴇᴏ ꜰᴏʀ <b>${type}</b>:`);
-            return;
-        }
-        else if (data.startsWith('rem_vid_')) {
-            const type = data.replace('rem_vid_', '');
-            const type_key = (type === 'after') ? 'after_welcome' : type;
-            config.videos[type_key] = []; await configCol.replaceOne({ _id: 'main' }, config);
-            bot.sendMessage(ADMIN_ID, `ᴄʟᴇᴀʀᴇᴅ ${type} ᴠɪᴅᴇᴏs!`);
-            return;
-        }
-        
-        // APPROVE / REJECT
-        if (data.startsWith('approve_')) {
-            const parts = data.split('_');
-            const uid = parts[1], pack = parts[2];
+        // Broadcast
+        if (text.startsWith('/bdc ') || captionText.startsWith('/bdc ')) {
+            let msgId = msg.message_id;
+            if (data.last_bdc_id === msgId) return;
+            data.last_bdc_id = msgId;
+            await saveData(data);
+
+            let bdcText = text.startsWith('/bdc ') ? text.substring(5) : captionText.substring(5);
+            let bdcPhoto = photo ? photo[photo.length - 1].file_id : null;
+            let bdcVideo = video ? video.file_id : null;
             
-            let targetUser = await usersCol.findOne({ id: uid });
-            if (targetUser) {
-                if (targetUser.history.pending > 0) targetUser.history.pending--;
-                targetUser.history.approved++; targetUser.history.total++;
-                if (!targetUser.active_packs.includes(pack)) targetUser.active_packs.push(pack);
-                await usersCol.replaceOne({ id: uid }, targetUser);
+            let successCount = 0;
+            let uniqueUsers = [...new Set(data.users)];
+            
+            bot.sendMessage(chatId, `⏳ Broadcast starting for ${uniqueUsers.length} users...`);
+            for (let uId of uniqueUsers) {
+                try {
+                    if (bdcPhoto) await bot.sendPhoto(uId, bdcPhoto, { caption: bdcText });
+                    else if (bdcVideo) await bot.sendVideo(uId, bdcVideo, { caption: bdcText });
+                    else await bot.sendMessage(uId, bdcText);
+                    successCount++;
+                } catch(e) {}
+                await new Promise(r => setTimeout(r, 35));
             }
-            
-            config.stats.approvals++; await configCol.replaceOne({ _id: 'main' }, config);
-
-            // Update Admin Message
-            bot.editMessageCaption(`✅ ᴀᴘᴘʀᴏᴠᴇᴅ ꜰᴏʀ <code>${uid}</code> (${categories[pack]})`, { chat_id: ADMIN_ID, message_id: msgId, parse_mode: 'HTML' });
-            
-            // Send Success to User
-            const txt = `✅ ᴘᴀʏᴍᴇɴᴛ sᴜᴄᴄᴇssꜰᴜʟ\n\n📦 ᴘʟᴀɴ: ${categories[pack]}\n💰 ᴘᴀɪᴅ: ₹${config.prices[pack]}\n\n👇 ᴄʟɪᴄᴋ ʟɪɴᴋ ʙᴇʟᴏᴡ ᴛᴏ ᴊᴏɪɴ`;
-            const kb = { inline_keyboard: [[{ text: '🔗 ᴊᴏɪɴ ɴᴏᴡ', url: config.links[pack] }]] };
-            await sendCleanMsg(uid, txt, kb, "https://i.ibb.co/7dh0gnf4/x.jpg", false);
+            bot.sendMessage(chatId, `✅ Broadcast successfully sent to ${successCount} unique users.`);
             return;
         }
-        else if (data.startsWith('reject_')) {
-            const parts = data.split('_');
-            const uid = parts[1], pack = parts[2];
-            
-            let targetUser = await usersCol.findOne({ id: uid });
-            if (targetUser) {
-                if (targetUser.history.pending > 0) targetUser.history.pending--;
-                await usersCol.replaceOne({ id: uid }, targetUser);
+
+        // Admin States
+        if (state === 'wait_upi' && text) {
+            data.settings.upi = text; data.states[chatId] = 'none'; await saveData(data);
+            return bot.sendMessage(chatId, `✅ UPI successfully updated to: ${text}`, { reply_markup: getAdminMenu() });
+        }
+        if (state === 'wait_username' && text) {
+            data.settings.support = text; data.states[chatId] = 'none'; await saveData(data);
+            return bot.sendMessage(chatId, `✅ Support username updated to: ${text}`, { reply_markup: getAdminMenu() });
+        }
+        if (state === 'wait_price_category' && text) {
+            if (categoryMap[text]) {
+                data.states[chatId] = 'wait_price_val_' + categoryMap[text]; await saveData(data);
+                return bot.sendMessage(chatId, `Send the new price for ${text} category (Numbers only):`, { reply_markup: { remove_keyboard: true } });
+            } else {
+                data.states[chatId] = 'none'; await saveData(data);
+                return bot.sendMessage(chatId, "❌ Cancelled.", { reply_markup: getAdminMenu() });
             }
-            
-            config.stats.rejections++; await configCol.replaceOne({ _id: 'main' }, config);
+        }
+        if (state.startsWith('wait_price_val_') && !isNaN(text)) {
+            let cat = state.replace('wait_price_val_', '');
+            data.settings[`price_${cat}`] = text; data.states[chatId] = 'none'; await saveData(data);
+            let displayName = Object.keys(categoryMap).find(k => categoryMap[k] === cat);
+            return bot.sendMessage(chatId, `✅ Price for ${displayName} updated to ₹${text}!`, { reply_markup: getAdminMenu() });
+        }
+        if (state === 'wait_link_category' && text) {
+            if (categoryMap[text]) {
+                data.states[chatId] = 'wait_link_val_' + categoryMap[text]; await saveData(data);
+                return bot.sendMessage(chatId, `Send the new private channel link for ${text}:`, { reply_markup: { remove_keyboard: true } });
+            } else {
+                data.states[chatId] = 'none'; await saveData(data);
+                return bot.sendMessage(chatId, "❌ Cancelled.", { reply_markup: getAdminMenu() });
+            }
+        }
+        if (state.startsWith('wait_link_val_') && text) {
+            let cat = state.replace('wait_link_val_', '');
+            data.settings[`link_${cat}`] = text; data.states[chatId] = 'none'; await saveData(data);
+            let displayName = Object.keys(categoryMap).find(k => categoryMap[k] === cat);
+            return bot.sendMessage(chatId, `✅ Link for ${displayName} successfully updated!`, { reply_markup: getAdminMenu() });
+        }
+        if (state === 'wait_demo_video' && video) {
+            if (!data.demos) data.demos = [];
+            data.demos.push(video.file_id); data.states[chatId] = 'none'; await saveData(data);
+            return bot.sendMessage(chatId, "✅ Demo video added successfully!", { reply_markup: getAdminMenu() });
+        }
+        if (state === 'wait_premium_image' && photo) {
+            data.settings.premium_image = photo[photo.length - 1].file_id; data.states[chatId] = 'none'; await saveData(data);
+            return bot.sendMessage(chatId, "✅ Premium selection image updated successfully!", { reply_markup: getAdminMenu() });
+        }
+        if (state === 'wait_how_to_video' && video) {
+            data.settings.how_to_video = video.file_id; data.states[chatId] = 'none'; await saveData(data);
+            return bot.sendMessage(chatId, "✅ 'How To Get Premium' video updated successfully!", { reply_markup: getAdminMenu() });
+        }
 
-            // Update Admin Message
-            bot.editMessageCaption(`❌ ʀᴇᴊᴇᴄᴛᴇᴅ ꜰᴏʀ <code>${uid}</code>`, { chat_id: ADMIN_ID, message_id: msgId, parse_mode: 'HTML' });
-            
-            // Send Fail to User
-            const txt = `❌ ᴘᴀʏᴍᴇɴᴛ ꜰᴀɪʟᴇᴅ\n\n⚠️ ʏᴏᴜʀ ᴘᴀʏᴍᴇɴᴛ ᴡᴀs ʀᴇᴊᴇᴄᴛᴇᴅ ʙʏ ᴀᴅᴍɪɴ.\n\n📞 ᴄᴏɴᴛᴀᴄᴛ sᴜᴘᴘᴏʀᴛ: ${config.support}`;
-            const kb = { inline_keyboard: [[{ text: '⬅️ ʙᴀᴄᴋ ᴛᴏ ʜᴏᴍᴇ', callback_data: 'home' }]] };
-            await sendCleanMsg(uid, txt, kb, "https://i.ibb.co/MkV55Kdk/x.jpg", false);
+        // Admin Menus
+        if (text === 'Change UPI') { data.states[chatId] = 'wait_upi'; await saveData(data); return bot.sendMessage(chatId, "Send the new UPI ID:"); }
+        if (text === 'Change Username') { data.states[chatId] = 'wait_username'; await saveData(data); return bot.sendMessage(chatId, "Send new support username (e.g., @newname):"); }
+        if (text === 'Change Price') {
+            data.states[chatId] = 'wait_price_category'; await saveData(data);
+            let kb = { keyboard: [[{ text: 'Indian' }, { text: 'R@p' }], [{ text: 'Child' }, { text: 'All' }]], resize_keyboard: true };
+            return bot.sendMessage(chatId, "Which category price do you want to change?", { reply_markup: kb });
+        }
+        if (text === 'Add Links') {
+            data.states[chatId] = 'wait_link_category'; await saveData(data);
+            let kb = { keyboard: [[{ text: 'Indian' }, { text: 'R@p' }], [{ text: 'Child' }, { text: 'All' }]], resize_keyboard: true };
+            return bot.sendMessage(chatId, "Which category link do you want to set?", { reply_markup: kb });
+        }
+        if (text === 'Add Demo Video') { data.states[chatId] = 'wait_demo_video'; await saveData(data); return bot.sendMessage(chatId, "Send the video you want to add as a demo now:"); }
+        if (text === 'Remove Demo') {
+            if (!data.demos || data.demos.length === 0) return bot.sendMessage(chatId, "No demo videos currently available.");
+            for (let i = 0; i < data.demos.length; i++) {
+                let kb = { inline_keyboard: [[{ text: '❌ Delete Demo', callback_data: `deldemo_${i}` }]] };
+                await bot.sendVideo(chatId, data.demos[i], { caption: `Demo Video #${i + 1}`, reply_markup: kb });
+            }
             return;
         }
-    }
-
-    // --- USER CALLBACKS ---
-    if (data === 'home') {
-        user.state = 'none'; await usersCol.replaceOne({ id: fromId }, user);
-        const welcomeText = `👋 ʜᴇʟʟᴏ, <b>${firstName}</b>!\n\n⭐️ ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ᴘʀᴇᴍɪᴜᴍ ʙᴏᴛ\n\n━━━━━━━━━━━━━━━━━\n⚜️ ᴘʀᴇᴍɪᴜᴍ ᴘʀɪᴄᴇ: ₹49 - ₹149\n💳 ᴘʟᴀɴs: 6 ᴘʟᴀɴs ᴀᴠᴀɪʟᴀʙʟᴇ\n━━━━━━━━━━━━━━━━━\n\n🔒 ᴘʀᴇᴍɪᴜᴍ ᴄᴏɴᴛᴇɴᴛ ᴀᴄᴄᴇss ᴋᴀʀɴᴇ ᴋᴇ ʟɪʏᴇ ᴘʀᴇᴍɪᴜᴍ ʟᴏ!`;
-        const kb = { inline_keyboard: [
-            [{ text: '🛒 ʙᴜʏ ᴘʀᴇᴍɪᴜᴍ', callback_data: 'buy_premium' }],
-            [{ text: '💎 ᴍʏ ᴘʀᴇᴍɪᴜᴍs 🥵', callback_data: 'my_premiums' }],
-            [{ text: '👤 ᴍʏ ᴘʀᴏꜰɪʟᴇ', callback_data: 'my_profile' }],
-            [{ text: '👀 ᴠɪᴇᴡ ᴅᴇᴍᴏ', callback_data: 'view_demo_0' }]
-        ]};
-        const vid = config.videos.welcome.length > 0 ? config.videos.welcome[0] : null;
-        await sendCleanMsg(chatId, welcomeText, kb, vid, !!vid);
-        return;
-    }
-
-    else if (data === 'buy_premium') {
-        let txt = "⚜️ ᴘʀᴇᴍɪᴜᴍ ᴘʟᴀɴs\n\n━━━━━━━━━━━━━━━━━\n";
-        for (const [key, name] of Object.entries(categories)) {
-            txt += `🔘 <b>${name}</b>\n   💰 ᴘʀɪᴄᴇ: ₹${config.prices[key]}\n   ⏳ ᴠᴀʟɪᴅɪᴛʏ: 30 ᴅᴀʏs\n\n`;
+        if (text === 'Change Premium Image') { data.states[chatId] = 'wait_premium_image'; await saveData(data); return bot.sendMessage(chatId, "Send the new image for the Premium Section now:"); }
+        if (text === 'Process Link Video') { data.states[chatId] = 'wait_how_to_video'; await saveData(data); return bot.sendMessage(chatId, "Send the video for 'How to Get Premium' now:"); }
+        if (text === 'Check Users List') {
+            let count = Object.keys(data.user_details).length;
+            await bot.sendMessage(chatId, `📊 **Total Bot Users:** ${count}\n\n_Generating JSON file format..._`, { parse_mode: 'Markdown' });
+            let jsonList = JSON.stringify(data.user_details, null, 2);
+            let chunks = jsonList.match(/[\s\S]{1,3900}/g) || [];
+            for (let chunk of chunks) await bot.sendMessage(chatId, `\`\`\`json\n${chunk}\n\`\`\``, { parse_mode: 'Markdown' });
+            return;
         }
-        txt += "━━━━━━━━━━━━━━━━━\n👈 sᴇʟᴇᴄᴛ ʏᴏᴜʀ ᴘʟᴀɴ ʙᴇʟᴏᴡ";
-
-        let kb = { inline_keyboard: [] };
-        for (const [key, name] of Object.entries(categories)) {
-            kb.inline_keyboard.push([{ text: `${name} - ₹${config.prices[key]}`, callback_data: `pay_${key}` }]);
+        if (text === 'Check History') {
+            let appr = data.history.approved || 0; let rej = data.history.rejected || 0;
+            return bot.sendMessage(chatId, `📈 **Payment History:**\n✅ Approved: ${appr}\n❌ Rejected: ${rej}`, { parse_mode: 'Markdown' });
         }
-        kb.inline_keyboard.push([{ text: '⬅️ ʙᴀᴄᴋ ᴛᴏ ʜᴏᴍᴇ', callback_data: 'home' }]);
-        await sendCleanMsg(chatId, txt, kb);
+    }
+
+    // User State: Screenshot
+    if (state === 'wait_screenshot' && photo) {
+        let photoId = photo[photo.length - 1].file_id;
+        data.states[chatId] = 'none';
+        let replyText = `⏳ Screenshot has been sent for approval\n\nYou will get private channel link within 20 minutes\n\nContact support ${data.settings.support} ✅`;
+        await bot.sendPhoto(chatId, 'https://i.ibb.co/ymm1Pvsv/x.png', { caption: replyText });
+
+        let adminCaption = `📢 New Payment Verification\n\n👤 User: ${firstName} (@${username})\n🆔 ID: ${chatId}\n\nApprove or Reject?`;
+        let adminKb = { inline_keyboard: [[{ text: '✅ Approve', callback_data: `approve_${chatId}` }, { text: '❌ Reject', callback_data: `reject_${chatId}` }]] };
+        await bot.sendPhoto(adminId, photoId, { caption: adminCaption, reply_markup: adminKb });
+        await saveData(data);
         return;
     }
 
-    else if (data.startsWith('pay_')) {
-        const pack = data.replace('pay_', '');
-        const price = config.prices[pack];
-        const plan_name = categories[pack];
-        const upi_id = config.upi.id;
-        const upi_name = encodeURIComponent(config.upi.name);
-        
-        const upi_link = `upi://pay?pa=${upi_id}&pn=${upi_name}&am=${price}&cu=INR`;
-        const qr_url = `https://quickchart.io/qr?size=300x300&text=${encodeURIComponent(upi_link)}`;
-
-        const txt = `📲 ᴜᴘɪ ᴘᴀʏᴍᴇɴᴛ\n\n━━━━━━━━━━━━━━━━━\n📦 ᴘʟᴀɴ: <b>${plan_name}</b>\n💰 ᴀᴍᴏᴜɴᴛ: ₹${price}\n⏳ ᴠᴀʟɪᴅɪᴛʏ: 30 ᴅᴀʏs\n━━━━━━━━━━━━━━━━━\n\n👤 ɴᴀᴍᴇ: ${decodeURIComponent(upi_name)}\n📱 ᴜᴘɪ ɪᴅ: <code>${upi_id}</code>\n\n📋 sᴛᴇᴘs:\n1️⃣ ᴜᴘᴀʀ Qʀ ᴄᴏᴅᴇ sᴄᴀɴ ᴋᴀʀᴏ\n2️⃣ ₹${price} ᴀᴍᴏᴜɴᴛ ᴀᴜʀ ɴᴏᴛᴇ ᴀᴜᴛᴏ-ꜰɪʟʟ ʜᴏɢᴀ\n3️⃣ ᴘɪɴ ᴅᴀᴀʟᴋᴇ ᴘᴀʏᴍᴇɴᴛ ᴄᴏᴍᴘʟᴇᴛᴇ ᴋᴀʀᴏ\n4️⃣ sᴄʀᴇᴇɴsʜᴏᴛ ʟᴏ ᴀᴜʀ ᴘᴀʏᴍᴇɴᴛ ᴅᴏɴᴇ ✅ ᴅᴀʙᴀᴏ`;
-
-        const kb = { inline_keyboard: [
-            [{ text: '✅ ᴘᴀʏᴍᴇɴᴛ ᴅᴏɴᴇ', callback_data: `check_pay_${pack}` }],
-            [{ text: '❌ ᴄᴀɴᴄᴇʟ', callback_data: 'buy_premium' }]
-        ]};
-        
-        await sendCleanMsg(chatId, txt, kb, qr_url, false);
-        return;
-    }
-
-    else if (data.startsWith('check_pay_')) {
-        const pack = data.replace('check_pay_', '');
-        user.state = `wait_screenshot_${pack}`; await usersCol.replaceOne({ id: fromId }, user);
-
-        const txt = "📸 ᴘᴀʏᴍᴇɴᴛ sᴄʀᴇᴇɴsʜᴏᴛ ʙʜᴇᴊᴏ\n\n✅ ᴜᴘɪ ᴘᴀʏᴍᴇɴᴛ ᴋᴀʀɴᴇ ᴋᴇ ʙᴀᴀᴅ sᴄʀᴇᴇɴsʜᴏᴛ ʏᴀʜᴀɴ ʙʜᴇᴊᴏ.\n\n⚠️ sɪʀꜰ ɪᴍᴀɢᴇ/sᴄʀᴇᴇɴsʜᴏᴛ ᴀᴄᴄᴇᴘᴛ ʜᴏɢᴀ";
-        await sendCleanMsg(chatId, txt, { inline_keyboard: [[{ text: '❌ ᴄᴀɴᴄᴇʟ', callback_data: 'buy_premium' }]] });
-        return;
-    }
-
-    else if (data === 'my_profile') {
-        const hist = user.history;
-        const status = user.active_packs.length > 0 ? "✅ ᴀᴄᴛɪᴠᴇ" : "❌ ɴᴏᴛ ᴀᴄᴛɪᴠᴇ";
-        const txt = `👤 ᴍʏ ᴘʀᴏꜰɪʟᴇ\n\n━━━━━━━━━━━━━━━━━\n🙍 ɴᴀᴍᴇ: ${firstName}\n📛 ᴜsᴇʀɴᴀᴍᴇ: @${username}\n🆔 ɪᴅ: <code>${fromId}</code>\n📅 ᴊᴏɪɴᴇᴅ: ${user.joined}\n━━━━━━━━━━━━━━━━━\n💎 ᴘʀᴇᴍɪᴜᴍ sᴛᴀᴛᴜs: ${status}\n━━━━━━━━━━━━━━━━━\n💳 ᴘᴀʏᴍᴇɴᴛ ʜɪsᴛᴏʀʏ:\n   ✅ ᴀᴘᴘʀᴏᴠᴇᴅ: ${hist.approved}\n   ⏳ ᴘᴇɴᴅɪɴɢ: ${hist.pending}\n   📊 ᴛᴏᴛᴀʟ: ${hist.total}\n━━━━━━━━━━━━━━━━━`;
-        await sendCleanMsg(chatId, txt, { inline_keyboard: [[{ text: '⬅️ ʙᴀᴄᴋ ᴛᴏ ʜᴏᴍᴇ', callback_data: 'home' }]] });
-        return;
-    }
-
-    else if (data === 'my_premiums') {
-        const active = user.active_packs;
-        if (active.length === 0) {
-            const txt = "💎 ᴍʏ ᴘʀᴇᴍɪᴜᴍs 🥵\n\n━━━━━━━━━━━━━━━━━\n❌ ᴀᴀᴘᴋᴇ ᴘᴀᴀs ᴋᴏɪ ᴀᴄᴛɪᴠᴇ ᴘʀᴇᴍɪᴜᴍ ɴᴀʜɪ ʜᴀɪ!\n\nᴘʀᴇᴍɪᴜᴍ ʟᴇɴᴇ ᴋᴇ ʟɪʏᴇ ɢᴇᴛ ᴘʀᴇᴍɪᴜᴍ ʙᴜᴛᴛᴏɴ ᴅᴀʙᴀᴏ.\n━━━━━━━━━━━━━━━━━";
-            const kb = { inline_keyboard: [[{ text: '🛒 ɢᴇᴛ ᴘʀᴇᴍɪᴜᴍ', callback_data: 'buy_premium' }], [{ text: '⬅️ ʙᴀᴄᴋ', callback_data: 'home' }]] };
-            await sendCleanMsg(chatId, txt, kb);
+    // Commands
+    if (text === '/start') {
+        if (isAdmin) {
+            let adminText = "Welcome Admin\nBot developed by @nglynx";
+            return bot.sendMessage(chatId, adminText, { reply_markup: getAdminMenu() });
         } else {
-            let txt = "💎 ᴍʏ ᴘʀᴇᴍɪᴜᴍs 🥵\n\n━━━━━━━━━━━━━━━━━\n✅ ᴀᴄᴛɪᴠᴇ ᴘᴀᴄᴋs:\n\n";
-            for (const p of active) txt += `⚜️ ${categories[p]}\n`;
-            txt += "━━━━━━━━━━━━━━━━━";
-            const kb = { inline_keyboard: [[{ text: '⬅️ ʙᴀᴄᴋ', callback_data: 'home' }]] };
-            await sendCleanMsg(chatId, txt, kb);
+            let userText = "Available Videos Collection?\n\n1. Mom Son videos - 5000+\n2. Sister Brother videos -2000+\n3. Cp kids videos - 15000+\n4. R@pe & Force videos-3000+\n5. Teen Girl. Videos - 6000+\n6. Indian Desi videos - 10000+\n7. Hidden cam videos - 2000+";
+            let inlineKb = { inline_keyboard: [[{ text: '💎 Get Premium', callback_data: 'get_premium' }], [{ text: '🥵 Demo Videos', callback_data: 'view_demos' }], [{ text: '✅ How To Get Premium', callback_data: 'how_to' }]] };
+            let replyKb = { keyboard: [[{ text: '💎 Get Premium' }], [{ text: 'PAYMENT DONE ✅' }]], resize_keyboard: true };
+            
+            await bot.sendPhoto(chatId, 'https://i.ibb.co/d4Ffygs4/x.jpg', { caption: userText, reply_markup: inlineKb });
+            return bot.sendMessage(chatId, "👇 Menu 👇", { reply_markup: replyKb });
+        }
+    }
+
+    if (text === '/help' && isAdmin) {
+        let helpText = "🛠 **Admin Commands & Tools:**\n\n🔹 **Change UPI:** Update the UPI ID where payments are sent.\n🔹 **Change Username:** Update the @support username shown to users.\n🔹 **Change Price / Add Links:** Modify prices and add unique channel links for different category packs.\n🔹 **Change Premium Image:** Customize the image shown on the 'Get Premium' menu.\n🔹 **Add / Remove Demo:** Manage videos in the demo section.\n🔹 **Check Users List:** See detailed list of users in JSON.\n🔹 **Check History:** See total approved and rejected payments.\n🔹 **/bdc <msg>:** Broadcast a message (or image/video with caption) to all users.";
+        return bot.sendMessage(chatId, helpText, { parse_mode: 'Markdown' });
+    }
+
+    if (text === '💎 Get Premium') return sendPremiumCategories(chatId, data);
+    if (text === 'PAYMENT DONE ✅') return askForScreenshot(chatId, data);
+});
+
+// --- Callback Queries ---
+bot.on('callback_query', async (query) => {
+    bot.answerCallbackQuery(query.id);
+    let dataStr = query.data;
+    let chatId = query.message.chat.id.toString();
+    let messageId = query.message.message_id;
+    let data = await getData();
+
+    if (dataStr === 'get_premium') return sendPremiumCategories(chatId, data);
+
+    if (dataStr === 'how_to') {
+        if (data.settings.how_to_video) {
+            return bot.sendVideo(chatId, data.settings.how_to_video, { caption: "✅ **How To Get Premium / Process Link**\nWatch this video to understand the process.", parse_mode: 'Markdown' });
+        } else {
+            return bot.sendMessage(chatId, "Video is not available right now. Please contact support.");
+        }
+    }
+
+    if (dataStr === 'view_demos') {
+        if (!data.demos || data.demos.length === 0) return bot.sendMessage(chatId, "No demo videos available right now.");
+        for (let vid of data.demos) {
+            let kb = { inline_keyboard: [[{ text: '👉 Get Premium', callback_data: 'get_premium' }]] };
+            await bot.sendVideo(chatId, vid, { caption: "🎬 This video is only for demo\n💎 Click Get Premium for VIP channels access", reply_markup: kb });
         }
         return;
     }
 
-    else if (data.startsWith('view_demo_')) {
-        const index = parseInt(data.replace('view_demo_', ''));
-        const demo_vids = config.videos.demo;
-        
-        if (demo_vids.length === 0) {
-            await sendCleanMsg(chatId, "⚠️ ɴᴏ ᴅᴇᴍᴏs ᴀᴠᴀɪʟᴀʙʟᴇ ʏᴇᴛ. ᴄʜᴇᴄᴋ ʙᴀᴄᴋ ʟᴀᴛᴇʀ!", { inline_keyboard: [[{ text: '⬅️ ʙᴀᴄᴋ', callback_data: 'home' }]] });
-            return;
+    if (dataStr.startsWith('deldemo_')) {
+        let index = parseInt(dataStr.replace('deldemo_', ''));
+        if (data.demos && data.demos[index] !== undefined) {
+            data.demos.splice(index, 1);
+            await saveData(data);
+            return bot.editMessageCaption("✅ Demo video deleted!", { chat_id: chatId, message_id: messageId });
         }
-        
-        let kb = { inline_keyboard: [] };
-        let nav = [];
-        if (index > 0) nav.push({ text: '⬅️ ᴘʀᴇᴠɪᴏᴜs', callback_data: `view_demo_${index - 1}` });
-        if (index < demo_vids.length - 1) nav.push({ text: 'ɴᴇxᴛ ➡️', callback_data: `view_demo_${index + 1}` });
-        if (nav.length > 0) kb.inline_keyboard.push(nav);
-        kb.inline_keyboard.push([{ text: '🛒 ɢᴇᴛ ᴘʀᴇᴍɪᴜᴍ', callback_data: 'buy_premium' }]);
-        kb.inline_keyboard.push([{ text: '⬅️ ʜᴏᴍᴇ', callback_data: 'home' }]);
+    }
 
-        await sendCleanMsg(chatId, `👀 ᴠɪᴇᴡ ᴅᴇᴍᴏ ${index + 1}/${demo_vids.length}`, kb, demo_vids[index], true);
+    if (dataStr.startsWith('pay_')) {
+        let cat = dataStr.replace('pay_', '');
+        let upi = data.settings.upi;
+        let price = data.settings[`price_${cat}`] || "199";
+        
+        let payText = `🏷️ 𝐏𝐫𝐢𝐜𝐞: ₹${price}\n\n⏳ 𝐓𝐢𝐦𝐞 𝐋𝐞𝐟𝐭: 02:00\n\n1️⃣ 𝐒𝐜𝐚𝐧  |  2️⃣ 𝐏𝐚𝐲  |  3️⃣ 𝐂𝐥𝐢𝐜𝐤 ' PAYMENT DONE '`;
+        let qrData = encodeURIComponent(`upi://pay?pa=${upi}&pn=Premium&am=${price}&cu=INR`);
+        let qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=35&data=${qrData}`;
+
+        let kb = { inline_keyboard: [[{ text: 'PAYMENT DONE SEND SCREENSHOT ✅', callback_data: 'ask_screenshot' }]] };
+        await bot.sendPhoto(chatId, qrUrl, { caption: payText, reply_markup: kb });
+
+        let packName = Object.keys(categoryMap).find(key => categoryMap[key] === cat) || cat.charAt(0).toUpperCase() + cat.slice(1);
+        let userMention = `<a href='tg://user?id=${chatId}'>User</a>`;
+        let qrAlertAdmin = `🔔 <b>New QR Code Requested!</b>\n\n👤 <b>User:</b> ${userMention}\n🆔 <b>Chat ID:</b> <code>${chatId}</code>\n📦 <b>Pack Clicked:</b> ${packName}`;
+        bot.sendMessage(adminId, qrAlertAdmin, { parse_mode: 'HTML' });
+
+        let waitList = await getWaiting();
+        waitList[chatId] = { time: Math.floor(Date.now() / 1000), pack: cat, price: price };
+        await saveWaiting(waitList);
+        return;
+    }
+
+    if (dataStr.startsWith('specialoffer_')) {
+        let parts = dataStr.split('_');
+        let cat = parts[1]; let discPrice = parts[2];
+        let upi = data.settings.upi;
+        
+        let payText = `🎁 <b>SPECIAL OFFER APPLIED!</b> 🎁\n\n🏷️ 𝐏𝐫𝐢𝐜𝐞: ₹${discPrice}\n\n⏳ 𝐓𝐢𝐦𝐞 𝐋𝐞𝐟𝐭: 02:00\n\n1️⃣ 𝐒𝐜𝐚𝐧  |  2️⃣ 𝐏𝐚𝐲  |  3️⃣ 𝐂𝐥𝐢𝐜𝐤 ' PAYMENT DONE '`;
+        let qrData = encodeURIComponent(`upi://pay?pa=${upi}&pn=Premium&am=${discPrice}&cu=INR`);
+        let qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=35&data=${qrData}`;
+
+        let kb = { inline_keyboard: [[{ text: 'PAYMENT DONE SEND SCREENSHOT ✅', callback_data: 'ask_screenshot' }]] };
+        await bot.sendPhoto(chatId, qrUrl, { caption: payText, parse_mode: 'HTML', reply_markup: kb });
+        
+        let waitList = await getWaiting();
+        if (waitList[chatId]) { delete waitList[chatId]; await saveWaiting(waitList); }
+        return;
+    }
+
+    if (dataStr === 'ask_screenshot') return askForScreenshot(chatId, data);
+
+    if (dataStr.startsWith('approve_')) {
+        let userId = dataStr.replace('approve_', '');
+        let kb = { inline_keyboard: [
+            [{ text: 'Indian Link', callback_data: `sendlink_indian_${userId}` }],
+            [{ text: 'R@p Link ', callback_data: `sendlink_premium_${userId}` }],
+            [{ text: 'Child Link', callback_data: `sendlink_movies_${userId}` }],
+            [{ text: 'All in One Link', callback_data: `sendlink_all_${userId}` }]
+        ]};
+        await bot.editMessageCaption("✅ Payment Approved. Which link to send?", { chat_id: chatId, message_id: messageId, reply_markup: kb });
+        data.history.approved = (data.history.approved || 0) + 1;
+        await saveData(data);
+        return;
+    }
+
+    if (dataStr.startsWith('reject_')) {
+        let userId = dataStr.replace('reject_', '');
+        let rejectText = `❌ YOUR PAYMENT WAS FAILED\nInvalid payment or fake payment\nContact support: ${data.settings.support}`;
+        await bot.sendPhoto(userId, 'https://i.ibb.co/h147XCFh/x.png', { caption: rejectText });
+        await bot.editMessageCaption(`❌ Payment Rejected for ${userId}.`, { chat_id: chatId, message_id: messageId });
+        data.history.rejected = (data.history.rejected || 0) + 1;
+        await saveData(data);
+        return;
+    }
+
+    if (dataStr.startsWith('sendlink_')) {
+        let parts = dataStr.split('_');
+        let pack = parts[1]; let userId = parts[2];
+        let link = data.settings[`link_${pack}`] || "https://t.me/fallback_link";
+        let displayName = Object.keys(categoryMap).find(key => categoryMap[key] === pack) || pack.charAt(0).toUpperCase() + pack.slice(1);
+        
+        let successText = `✅ YOUR PAYMENT IS SUCCESSFULLY APPROVED\n\nClick below link to join private channel\n\nPack: ${displayName}\nLink: ${link}\nContact support ${data.settings.support}`;
+        await bot.sendPhoto(userId, 'https://i.ibb.co/Dfz7CSMV/x.png', { caption: successText });
+        await bot.editMessageCaption(`✅ Link sent to user ${userId}.`, { chat_id: chatId, message_id: messageId });
         return;
     }
 });
 
-// Error handling to prevent crashes
-bot.on("polling_error", (err) => console.log("Polling Error:", err.message));
+// --- Helper Functions Logic ---
+async function sendPremiumCategories(chatId, data) {
+    let img = data.settings.premium_image || 'https://i.ibb.co/9x38myC/x.jpg';
+    let kb = { inline_keyboard: [
+        [{ text: '👉 INDIAN VIDEOS 👈', callback_data: 'pay_indian' }],
+        [{ text: '🤤 R@P VIDEOS 🤤', callback_data: 'pay_premium' }],
+        [{ text: '👄 CHILD VIDEOS (50k+)😵', callback_data: 'pay_movies' }],
+        [{ text: '🥵 ALL IN ONE 50+ GROUPS ✅', callback_data: 'pay_all' }]
+    ]};
+    await bot.sendPhoto(chatId, img, { reply_markup: kb });
+}
+
+async function askForScreenshot(chatId, data) {
+    let waitList = await getWaiting();
+    if (waitList[chatId]) { delete waitList[chatId]; await saveWaiting(waitList); }
+    
+    data.states[chatId] = 'wait_screenshot'; await saveData(data);
+    await bot.sendMessage(chatId, "📸 𝙎𝙀𝙉𝘿 𝙎𝘾𝙍𝙀𝙀𝙉𝙎𝙃𝙊𝙏 𝙊𝙁 𝙔𝙊𝙐𝙍 𝙋𝘼𝙔𝙈𝙀𝙉𝙏 𝙁𝙊𝙍 𝙂𝙀𝙏 𝙋𝙍𝙀𝙈𝙄𝙐𝙈");
+}
+
+bot.on('polling_error', (error) => console.log(error.message));
