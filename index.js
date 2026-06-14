@@ -5,7 +5,7 @@ const { MongoClient } = require('mongodb');
 // CONFIGURATION & SETUP
 // ==========================================
 // Railway Environment Variables fetch karega, warna default use karega
-const API_TOKEN = process.env.BOT_TOKEN || '8697512834:AAFuVy3dT7TiSFtppB9rd-Ssp3yIQm15zJc';
+const API_TOKEN = process.env.BOT_TOKEN || '8962692068:AAGlyid0J5PwKsuVeLDr9dMWmNM7Mm94-Ig';
 const ADMIN_ID = process.env.ADMIN_ID || '5909070731';
 const MONGO_URL = process.env.MONGO_URL; // Railway ka MongoDB URL
 
